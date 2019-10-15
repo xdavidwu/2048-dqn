@@ -11,17 +11,19 @@
 #include <tensorflow/cc/framework/gradients.h>
 #include <absl/strings/string_view.h>
 
+#include <sys/time.h>
+
 using namespace tensorflow;
 using namespace tensorflow::ops;
 
-#define MEM_SIZE	1<<20
-#define MEM_START_TRAIN	1<<16
-#define BATCH	512
+#define MEM_SIZE	1<<17
+#define MEM_START_TRAIN	1<<17
+#define BATCH	1<<9
 #define QT_UPDATE_INT	64
-#define PRINT_INT	4096
+#define PRINT_INT	(1L<<16)
 #define DOUBLE_DQN	0
 #define GAMMA	0.94f
-#define LEARNING_RATE	0.0002
+#define LEARNING_RATE	0.000005
 //static float LEARNING_RATE=1;
 typedef struct{
 	cell_t s[16];
@@ -107,7 +109,6 @@ static std::vector<Output> qt_update({
 		Assign(scope,qt_w2,w2)
 		});
 
-// TODO stddev for truncated normal
 static std::vector<Output> q_init({
 		Assign(scope,cb,Fill(scope,{256},float(0.0))),
 		Assign(scope,cw,Multiply(scope,TruncatedNormal(scope,{2,2,1,256},DT_FLOAT),Fill(scope,{2,2,1,256},float(sqrt(2.0/(2*2*1+256)))))),
@@ -148,6 +149,14 @@ static std::thread* prefetch_thread=nullptr;
 static std::vector<mem_t> bat(BATCH);
 static std::vector<mem_t>::iterator it;
 
+static float loss_sum=0.0;
+
+//static long us_sum=0;
+
+static Tensor *s,*sp;
+static Tensor *s1=new Tensor(DT_FLOAT, TensorShape{BATCH,4,4}),*sp1=new Tensor(DT_FLOAT, TensorShape{BATCH,4,4});
+static Tensor *s2=new Tensor(DT_FLOAT, TensorShape{BATCH,4,4}),*sp2=new Tensor(DT_FLOAT, TensorShape{BATCH,4,4});
+
 static inline void gen_log2(){
 	for(int a=4;a<(1<<18);a+=4) log2tbl[a>>2]=std::log2f(a);
 }
@@ -162,15 +171,16 @@ void dqnagent_pushmem(cell_t *s,dir_t a,score_t r,cell_t *sp,int isterm){
 	memcpy(nmem.s,s,sizeof(cell_t)*16);
 	memcpy(nmem.sp,sp,sizeof(cell_t)*16);
 	replaymem[replaymem_idx++]=nmem;
-	if(replaymem_idx==MEM_SIZE){
+	if(unlikely(replaymem_idx==MEM_SIZE)){
 		replaymem_full=1;
 		replaymem_idx=0;
 	}
 }
 
-void dqnagent_init(){
+static void dqnagent_init(){
 	SessionOptions opt;
-	opt.config.mutable_gpu_options()->set_per_process_gpu_memory_fraction(0.5);
+	//opt.config.mutable_gpu_options()->set_per_process_gpu_memory_fraction(0.9);
+	//opt.config.mutable_graph_options()->mutable_optimizer_options()->set_global_jit_level(tensorflow::OptimizerOptions::OFF);
 	cs=new ClientSession(scope,opt);
 	TF_CHECK_OK(cs->Run({},q_init,nullptr));
 	TF_CHECK_OK(cs->Run({},rms_init,nullptr));
@@ -188,22 +198,36 @@ void dqnagent_init(){
 	step.push_back(ApplyRMSProp(scope,w2,w2_ms,w2_mom,lr,rho,mom,ep,{grad_outputs[7]}));
 }
 
+Tensor x_d(DT_FLOAT, TensorShape{1,4,4});
+auto x_df=x_d.flat<float>().data();
+
 dir_t dqnagent_getact(cell_t *s){
-	if(dbl_rand()<epsilon){
+	if(unlikely(dbl_rand()<epsilon)){
 		return static_cast<dir_t>(rand()&0x3);
 	}
-	Tensor x_d(DT_FLOAT, TensorShape{1,4,4});
+	for(int a=0;a<16;a++) x_df[a]=(float)s[a];
 	std::vector<Tensor> outputs;
-	for(int a=0;a<16;a++) x_d.flat<float>()(a)=(float)s[a];
-	TF_CHECK_OK(cs->Run({{x,x_d}},{argmax,y},&outputs));
+	TF_CHECK_OK(cs->Run({{x,x_d}},{argmax},&outputs));
 	return static_cast<dir_t>(outputs[0].scalar<int>()());
 }
 
-void sample_thr(){
-	if(replaymem_full) it=replaymem.end();
+static void sample_thr(){
+	if(unlikely(replaymem_full)) it=replaymem.end();
 	else it=replaymem.begin()+replaymem_idx-1;
 	std::experimental::sample(replaymem.begin(),it,bat.begin(),BATCH,std::mt19937_64{std::random_device{}()});
+	auto mf=((print_counter&0x1)?s1:s2)->flat<float>().data();
+	auto mfp=((print_counter&0x1)?sp1:sp2)->flat<float>().data();
+#pragma omp parallel for num_threads(2)
+	for(int i=0;i<BATCH;i++){
+		for(int j=0;j<16;j++){
+			mf[i*16+j]=(float)bat[i].s[j];
+			mfp[i*16+j]=(float)bat[i].sp[j];
+		}
+	}
 }
+
+static Tensor q_,ya,ynxt,ym;
+//struct timeval tp,ta;
 
 void dqnagent_train(){
 	if(unlikely(block_train||((!replaymem_full)&&replaymem_idx<MEM_START_TRAIN))) return;
@@ -211,66 +235,89 @@ void dqnagent_train(){
 		if(replaymem_full) it=replaymem.end();
 		else it=replaymem.begin()+replaymem_idx-1;
 		std::experimental::sample(replaymem.begin(),it,bat.begin(),BATCH,std::mt19937_64{std::random_device{}()});
-	}
-	else{
-		prefetch_thread->join();
-		delete prefetch_thread;
-	}
-	std::vector<Tensor> outputs;
-	Tensor s(DT_FLOAT, TensorShape{BATCH,4,4});
-	Tensor sp(DT_FLOAT, TensorShape{BATCH,4,4});
-	for(int i=0;i<BATCH;i++){
-		for(int j=0;j<16;j++){
-			s.flat<float>()(i*16+j)=(float)bat[i].s[j];
-			sp.flat<float>()(i*16+j)=(float)bat[i].sp[j];
+		auto mf=((print_counter&0x1)?s1:s2)->flat<float>().data();
+		auto mfp=((print_counter&0x1)?sp1:sp2)->flat<float>().data();
+#pragma omp parallel for num_threads(2)
+		for(int i=0;i<BATCH;i++){
+			for(int j=0;j<16;j++){
+				mf[i*16+j]=(float)bat[i].s[j];
+				mfp[i*16+j]=(float)bat[i].sp[j];
+			}
 		}
 	}
-	Tensor q_,ya,ynxt,ym;
+	else{
+		//gettimeofday(&tp,NULL);
+		prefetch_thread->join();
+		delete prefetch_thread;
+		//gettimeofday(&ta,NULL);
+		//us_sum+=(ta.tv_sec-tp.tv_sec)*1000000+ta.tv_usec-tp.tv_usec;
+	}
+	print_counter++;
+	prefetch_thread=new std::thread(sample_thr);
+	s=(print_counter&0x1)?s2:s1;
+	sp=(print_counter&0x1)?sp2:sp1;
+	std::vector<Tensor> outputs;
 	if(DOUBLE_DQN){
-		TF_CHECK_OK(cs->Run({{x,s}},{y},&outputs));
+		TF_CHECK_OK(cs->Run({{x,*s}},{y},&outputs));
 		q_=outputs[0];
-		TF_CHECK_OK(cs->Run({{x,sp},{qt_x,sp}},{argmax,qt_y},&outputs));
+		TF_CHECK_OK(cs->Run({{x,*sp},{qt_x,*sp}},{argmax,qt_y},&outputs));
 		ya=outputs[0];
 		ynxt=outputs[1];
 	}
 	else{
-		TF_CHECK_OK(cs->Run({{qt_x,sp},{x,s}},{y,qt_ymax},&outputs));
+		TF_CHECK_OK(cs->Run({{qt_x,*sp},{x,*s}},{y,qt_ymax},&outputs));
 		q_=outputs[0];
 		ym=outputs[1];
 	}
 	float r;
-	for(int i=0;i<BATCH;i++){
-		r=(bat[i].r)?log2tbl[bat[i].r>>2]:0.0;
-		if(unlikely(bat[i].isterm)){
-			q_.matrix<float>()(i,bat[i].a)=r;
-		}
-		else{
-			if(DOUBLE_DQN){
-				q_.matrix<float>()(i,bat[i].a)=r+GAMMA*ynxt.matrix<float>()(i,
-						ya.matrix<int>()(i));
+	auto qm=q_.matrix<float>();
+	if(DOUBLE_DQN){
+		auto ynxtm=ynxt.matrix<float>();
+		auto yam=ya.flat<int>().data();
+		for(int i=0;i<BATCH;i++){
+			r=(bat[i].r)?log2tbl[bat[i].r>>2]:0.0;
+			if(unlikely(bat[i].isterm)){
+				qm(i,bat[i].a)=r;
 			}
 			else{
-				q_.matrix<float>()(i,bat[i].a)=r+GAMMA*ym.flat<float>()(i);
+				qm(i,bat[i].a)=r+GAMMA*ynxtm(i,yam[i]);
 			}
 		}
 	}
-	if(likely(print_counter!=PRINT_INT-1)){
-		prefetch_thread=new std::thread(sample_thr);
+	else{
+		auto ymm=ym.flat<float>().data();
+		for(int i=0;i<BATCH;i++){
+			r=(bat[i].r)?log2tbl[bat[i].r>>2]:0.0;
+			if(unlikely(bat[i].isterm)){
+				qm(i,bat[i].a)=r;
+			}
+			else{
+				qm(i,bat[i].a)=r+GAMMA*ymm[i];
+			}
+		}	
 	}
-	TF_CHECK_OK(cs->Run({{x,s},{yp,q_}},{step},nullptr));
+		
+	TF_CHECK_OK(cs->Run({{x,*s},{yp,q_}},{step},nullptr));
+	if(likely(print_counter&0xF))return;
+	TF_CHECK_OK(cs->Run({{x,*s},{yp,q_}},{loss},&outputs));
+	loss_sum+=outputs[0].scalar<float>()();
 	if(unlikely(++train_counter==QT_UPDATE_INT)){
 		train_counter=0;
 		TF_CHECK_OK(cs->Run({},{qt_update},nullptr));
 	}
-	if(unlikely(++print_counter==PRINT_INT)){
+	if(unlikely(print_counter==PRINT_INT)){
 		print_counter=0;
-		TF_CHECK_OK(cs->Run({{x,s},{yp,q_}},{y,loss},&outputs));
-		for(int i=0;i<16;i++)std::cout<<bat[BATCH-1].s[i]<<" ";
-		std::cout<<"\n"<<bat[BATCH-1].a<<" "<<bat[BATCH-1].r<<"\n";
-		for(int i=0;i<16;i++)std::cout<<bat[BATCH-1].sp[i]<<" ";
-		std::cout<<bat[BATCH-1].isterm<<std::endl;
-		std::cout<<outputs[1].scalar<float>()<<" "<<q_.matrix<float>()(BATCH-1,bat[BATCH-1].a)<<" "<<outputs[0].matrix<float>()(BATCH-1,bat[BATCH-1].a)<<" "<<r<<std::endl;
-		prefetch_thread=new std::thread(sample_thr);
+//		std::cout<<us_sum/PRINT_INT<<std::endl;
+//		us_sum=0;
+//		TF_CHECK_OK(cs->Run({{x,s},{yp,q_}},{y,loss},&outputs));
+		//for(int i=0;i<16;i++)std::cout<<bat[BATCH-1].s[i]<<" ";
+		//std::cout<<"\n"<<bat[BATCH-1].a<<" "<<bat[BATCH-1].r<<"\n";
+		//for(int i=0;i<16;i++)std::cout<<bat[BATCH-1].sp[i]<<" ";
+		//std::cout<<bat[BATCH-1].isterm<<std::endl;
+//		std::cout<<outputs[1].scalar<float>()<<" "<<q_.matrix<float>()(BATCH-1,bat[BATCH-1].a)<<" "<<outputs[0].matrix<float>()(BATCH-1,bat[BATCH-1].a)<<" "<<r<<std::endl;
+//		prefetch_thread=new std::thread(sample_thr);
+		std::cout<<loss_sum/(PRINT_INT>>4)<<std::endl;
+		loss_sum=0.0;
 	}
 }
 
@@ -280,31 +327,37 @@ int main(){
 	agent_t dqnagent={.getact=dqnagent_getact,.pushmem=dqnagent_pushmem,.train=dqnagent_train};
 	srand(time(NULL));
 	epsilon=1.0f;
+	double epsilon_append=0.98;
 	double epsilon_bak;
 	while((!replaymem_full)&&replaymem_idx<MEM_START_TRAIN) episode(dqnagent);
 	puts("Filled");
-	FZTE(j,150){
+	FZTE(j,400){
 		unsigned int tscore=0,tstep=0;
+		epsilon=1.0/(j*1.5/10.0);
 		FZTE(i,100){
 			log_t elog=episode(dqnagent);
 			tscore+=elog.score;
 			tstep+=elog.step;
-			epsilon*=0.9997f;//7f;
+			//epsilon_append*=0.999f;//7f;
+			//epsilon=0.03+epsilon_append;
 		}
-		printf("Train %d %f %u %u\n",j,epsilon,tscore/100,tstep/100);
-		epsilon_bak=epsilon;
-		epsilon=0.0f;
-		block_train=1;
-		tscore=0;
-		tstep=0;
-		FZTE(i,100){
-			log_t elog=episode(dqnagent);
-			tscore+=elog.score;
-			tstep+=elog.step;
+		printf("Train %d %f %u %u %f\n",j,epsilon,tscore/100,tstep/100,(float)tscore/tstep);
+		if(!(j%4)){
+			epsilon_bak=epsilon;
+			epsilon=0.0f;
+			block_train=1;
+			tscore=0;
+			tstep=0;
+			FZTE(i,100){
+				log_t elog=episode(dqnagent);
+				tscore+=elog.score;
+				tstep+=elog.step;
+			}
+			printf("Test %d %f %u %u %f\n",j,epsilon,tscore/100,tstep/100,(float)tscore/tstep);
+			block_train=0;
+			epsilon=epsilon_bak;
 		}
-		printf("Test %d %f %u %u\n",j,epsilon,tscore/100,tstep/100);
-		block_train=0;
-		epsilon=epsilon_bak;
 	}
+	delete cs;
 	return 0;
 }

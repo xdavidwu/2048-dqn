@@ -38,11 +38,6 @@ typedef struct{
 	u32 step;
 }log_t;
 
-extern cell_t *new_grid(); 
-extern void print_grid(cell_t *grid);
-extern cell_t *move(cell_t *grid,dir_t dir,score_t *score);
-extern int add_cell(cell_t *grid);
-
 extern dir_t randomagent_getact();
 
 

@@ -1,13 +1,13 @@
 #include "2048.h"
 
-const cell_t init_grid[]={
+static const cell_t init_grid[]={
 	0,1,0,0,
 	0,2,0,1,
 	0,0,0,0,
 	1,0,1,2
 };
 
-cell_t *new_grid(){
+static cell_t *new_grid(){
 	cell_t *g=malloc(sizeof(cell_t)*16);
 	/* 0, 1, 0, 0
 	 * 0, 2, 0, 1
@@ -18,7 +18,7 @@ cell_t *new_grid(){
 	return g;
 }
 
-void print_grid(cell_t *grid){
+static void print_grid(cell_t *grid){
 	FZTE(i,4){
 		FZTE(j,4){
 			if(grid[LOC(i,j)])printf("\t%u",1<<grid[LOC(i,j)]);
@@ -28,7 +28,7 @@ void print_grid(cell_t *grid){
 	}
 }
 
-cell_t *move(cell_t *grid,dir_t dir,score_t *score){
+static void move(cell_t *grid,dir_t dir,score_t *score){
 	cell_t tmp[4];
 	switch(dir){
 		case L:
@@ -124,10 +124,9 @@ cell_t *move(cell_t *grid,dir_t dir,score_t *score){
 			}
 			break;
 		}
-	return grid;
 }
 
-int add_cell(cell_t *grid){
+static int add_cell(cell_t *grid){
 	u32 c=0;
 	FZTE(i,16) if(!grid[i])c++;
 	if(!c)return 0;
@@ -153,9 +152,9 @@ log_t episode(agent_t agent){
 	log.step=0;
 	cell_t *grid=new_grid();
 	//print_grid(grid);
+	cell_t og[16];
 	while(1){
 		score_t os=log.score;
-		cell_t og[16];
 		memcpy(og,grid,sizeof(cell_t)*16);
 		dir_t act=agent.getact(grid);
 		move(grid,act,&(log.score));
@@ -180,9 +179,10 @@ log_t episode(agent_t agent){
 			default:
 				continue;
 		}*/
-		if(!add_cell(grid)){
+		if(unlikely(!add_cell(grid))){
 			agent.pushmem(og,act,log.score-os,grid,1);
 			agent.train();
+			free(grid);
 			return log;
 		}
 		agent.pushmem(og,act,log.score-os,grid,0);
@@ -190,5 +190,4 @@ log_t episode(agent_t agent){
 		//printf("%u\n",s);
 		//print_grid(grid);
 	}
-	return log;
 }
